@@ -47,7 +47,8 @@ data class ModelInfo(
     val directAcousticUrl: String? = null,
     val ggufMd5: String? = null,
     val mmprojMd5: String? = null,
-    val acousticMd5: String? = null
+    val acousticMd5: String? = null,
+    val expertsRemotePrefix: String? = null
 ) {
     /** True for text-only models that have no vision projector. */
     val isTextOnly: Boolean
@@ -89,6 +90,29 @@ data class ModelInfo(
 
     companion object {
         val AVAILABLE_MODELS = listOf(
+            ModelInfo(
+                id = "minicpm-v-4_7-1b",
+                displayName = "MiniCPM-V 4.7 1B (local test)",
+                descriptionResName = "Image and text model; approximately 1.8 GB download.",
+                ggufFileName = "MiniCPM-V-4_7-1B-Q4_K_M.gguf",
+                mmprojFileName = "mmproj-model-f16.gguf",
+                hfRepo = "tc-mb/MiniCPM-V-Apps-gguf",
+                msRepo = "zerg13/MiniCPM-V-Apps-gguf",
+                ggufRemoteName = "MiniCPM-V-4.7-1B/MiniCPM-V-4_7-1B-Q4_K_M.gguf",
+                mmprojRemoteName = "MiniCPM-V-4.7-1B/mmproj-model-f16.gguf"
+            ),
+            ModelInfo(
+                id = "minicpm-v-4_7-35b",
+                displayName = "MiniCPM-V 4.7 35B (experimental)",
+                descriptionResName = "Streams experts from internal storage; approximately 16.6 GB download. Recommended RAM: 12 GB.",
+                ggufFileName = "MiniCPM-V-4_7-35B-A3B-mix_q3gud_im-les.gguf",
+                mmprojFileName = "mmproj-model-f16.gguf",
+                hfRepo = "tc-mb/MiniCPM-V-Apps-gguf",
+                msRepo = "zerg13/MiniCPM-V-Apps-gguf",
+                ggufRemoteName = "MiniCPM-V-4.7-35B-A3B/MiniCPM-V-4_7-35B-A3B-mix_q3gud_im-les.gguf",
+                mmprojRemoteName = "MiniCPM-V-4.7-35B-A3B/mmproj-model-f16.gguf",
+                expertsRemotePrefix = "MiniCPM-V-4.7-35B-A3B/experts"
+            ),
             ModelInfo(
                 id = "minicpm-v-4",
                 displayName = "MiniCPM-V-4 (Q4_K_M)",

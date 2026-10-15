@@ -5,6 +5,7 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+#include <cstdlib>
 
 #include "logging.h"
 #include "chat.h"
@@ -57,6 +58,22 @@ static mtmd_context                     * g_ctx_vision;
 // 100045 = o-4.5
 // 46/460/461 = V-4.6 (instruct/thinking)
 static int                                g_minicpmv_version = 0;
+static std::string                        g_experts_path;
+static mtmd_bitmap                      * g_pending_bitmap = nullptr;
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_example_minicpm_1v_1demo_LlamaEngine_configureExpertsNative(
+        JNIEnv *env, jobject, jstring jpath, jint window) {
+    const char *path = env->GetStringUTFChars(jpath, nullptr);
+    g_experts_path = path;
+    env->ReleaseStringUTFChars(jpath, path);
+    const bool enabled = !g_experts_path.empty();
+    const std::string width = std::to_string(enabled ? window : 0);
+    setenv("LLAMA_MOE_DECODE_WINDOW", width.c_str(), 1);
+    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", enabled ? "1" : "0", 1);
+    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH", enabled ? "4" : "0", 1);
+}
 
 // Most recent slice cap requested by the upper layer.  Persists across
 // loadMmproj calls so a user-chosen value survives e.g. an unload/reload
@@ -120,6 +137,12 @@ extern "C"
 JNIEXPORT jint JNICALL
 Java_com_example_minicpm_1v_1demo_LlamaEngine_load(JNIEnv *env, jobject, jstring jmodel_path) {
     llama_model_params model_params = llama_model_default_params();
+    model_params.n_gpu_layers = 0;
+    if (!g_experts_path.empty()) {
+        model_params.moe_experts_path = g_experts_path.c_str();
+        model_params.moe_slot_bank = 64;
+        model_params.use_mmap = true;
+    }
 
     const auto *model_path = env->GetStringUTFChars(jmodel_path, 0);
     LOGi("%s: Loading model from: \n%s\n", __func__, model_path);
@@ -135,7 +158,12 @@ Java_com_example_minicpm_1v_1demo_LlamaEngine_load(JNIEnv *env, jobject, jstring
     fclose(f);
     LOGi("%s: Model file size: %ld bytes (%.2f GB)", __func__, file_size, file_size / (1024.0 * 1024.0 * 1024.0));
 
-    auto *model = llama_model_load_from_file(model_path, model_params);
+    llama_model *model = nullptr;
+    try {
+        model = llama_model_load_from_file(model_path, model_params);
+    } catch (const std::exception &e) {
+        LOGe("Model load failed: %s", e.what());
+    }
     env->ReleaseStringUTFChars(jmodel_path, model_path);
     if (!model) {
         LOGe("%s: llama_model_load_from_file returned null! Check logcat for llama.cpp internal errors.", __func__);
@@ -254,10 +282,15 @@ static llama_context *init_context(llama_model *model, const int n_ctx = DEFAULT
     }
     ctx_params.n_ctx = n_ctx;
     ctx_params.n_batch = BATCH_SIZE;
-    ctx_params.n_ubatch = BATCH_SIZE;
+    ctx_params.n_ubatch = g_experts_path.empty() ? BATCH_SIZE : 8;
     ctx_params.n_threads = N_THREADS;
     ctx_params.n_threads_batch = N_THREADS;
-    auto *context = llama_init_from_model(g_model, ctx_params);
+    llama_context *context = nullptr;
+    try {
+        context = llama_init_from_model(g_model, ctx_params);
+    } catch (const std::exception &e) {
+        LOGe("Context creation failed: %s", e.what());
+    }
     if (context == nullptr) {
         LOGe("%s: llama_new_context_with_model() returned null)", __func__);
     }
@@ -318,13 +351,17 @@ static bool g_image_prefilled = false;
 static bool g_vision_mode = false;
 
 static void reset_long_term_states(const bool clear_kv_cache = true) {
+    if (g_pending_bitmap) {
+        mtmd_bitmap_free(g_pending_bitmap);
+        g_pending_bitmap = nullptr;
+    }
     chat_msgs.clear();
     system_prompt_position = 0;
     current_position = 0;
     g_image_prefilled = false;
     g_vision_mode = false;
 
-    if (clear_kv_cache)
+    if (clear_kv_cache && g_context)
         llama_memory_clear(llama_get_memory(g_context), false);
 }
 
@@ -333,6 +370,9 @@ static void reset_long_term_states(const bool clear_kv_cache = true) {
 // v4.0 / v2.x use plain ChatML and have no thinking toggle.
 static const char * assistant_turn_prefix() {
     switch (g_minicpmv_version) {
+        case 47:
+        case 471:
+            return "<|im_start|>assistant\n<think>\n\n</think>\n\n";
         case 46:
         case 460:
         case 461:
@@ -510,6 +550,15 @@ Java_com_example_minicpm_1v_1demo_LlamaEngine_prefillImage(
         return 3;
     }
 
+    // The 4.7 template places the image inside the following user turn.
+    if (g_minicpmv_version == 47 || g_minicpmv_version == 471) {
+        if (g_pending_bitmap) mtmd_bitmap_free(g_pending_bitmap);
+        g_pending_bitmap = bitmap;
+        g_image_prefilled = true;
+        g_vision_mode = true;
+        return 0;
+    }
+
     mtmd_input_text text;
     text.text = mtmd_default_marker();
     text.add_special = current_position == 0;
@@ -611,7 +660,9 @@ Java_com_example_minicpm_1v_1demo_LlamaEngine_processUserPrompt(
         // caller passes only a user message. If a system message is
         // required it must be added through processSystemPrompt()
         // *before* the first processUserPrompt() call.
-        formatted_user_prompt += "<|im_start|>user\n" + content_for_format + "<|im_end|>\n";
+        formatted_user_prompt += "<|im_start|>user\n";
+        if (g_pending_bitmap) formatted_user_prompt += std::string(mtmd_default_marker()) + "\n";
+        formatted_user_prompt += content_for_format + "<|im_end|>\n";
         formatted_user_prompt += assistant_turn_prefix();
 
         common_chat_msg new_msg;
@@ -649,7 +700,14 @@ Java_com_example_minicpm_1v_1demo_LlamaEngine_processUserPrompt(
         text.parse_special = true;
 
         mtmd_input_chunks * chunks = mtmd_input_chunks_init();
-        int32_t res = mtmd_tokenize(g_ctx_vision, chunks, &text, nullptr, 0);
+        const mtmd_bitmap *pending[] = { g_pending_bitmap };
+        int32_t res = mtmd_tokenize(g_ctx_vision, chunks, &text,
+                                   g_pending_bitmap ? pending : nullptr,
+                                   g_pending_bitmap ? 1 : 0);
+        if (g_pending_bitmap) {
+            mtmd_bitmap_free(g_pending_bitmap);
+            g_pending_bitmap = nullptr;
+        }
         if (res != 0) {
             LOGe("%s: mtmd_tokenize failed with code %d", __func__, res);
             mtmd_input_chunks_free(chunks);
@@ -798,10 +856,14 @@ Java_com_example_minicpm_1v_1demo_LlamaEngine_unload(JNIEnv * /*env*/, jobject /
     }
 
     common_sampler_free(g_sampler);
+    g_sampler = nullptr;
     g_chat_templates.reset();
     llama_batch_free(g_batch);
+    g_batch = {};
     llama_free(g_context);
+    g_context = nullptr;
     llama_model_free(g_model);
+    g_model = nullptr;
 }
 
 extern "C"

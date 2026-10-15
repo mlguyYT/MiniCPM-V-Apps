@@ -28,6 +28,7 @@ import java.net.URL
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import org.json.JSONObject
 
 sealed class LlamaState {
     object Uninitialized : LlamaState()
@@ -160,6 +161,12 @@ class LlamaEngine private constructor(
         fun modelsExist(context: Context): Boolean {
             val model = getSelectedModel(context)
             if (!File(modelPath(context)).exists()) return false
+            if (model.expertsRemotePrefix != null) {
+                val dir = File(modelDirFor(context, model), "experts")
+                if (!runCatching {
+                    expertFiles(dir).all { (name, size) -> File(dir, name).length() == size }
+                }.getOrDefault(false)) return false
+            }
             if (model.isTextOnly) return true
             if (model.isTts) {
                 val ap = acousticPath(context) ?: return true
@@ -309,6 +316,8 @@ class LlamaEngine private constructor(
         // any future callers can reuse the same mapping without re-grepping
         // model ids in three places.
         fun inferMinicpmvVersion(model: ModelInfo): Int = when (model.id) {
+            "minicpm-v-4_7-1b" -> 471
+            "minicpm-v-4_7-35b" -> 47
             "minicpm-v-4_6-instruct" -> 46
             "minicpm-v-4"            -> 5
             else                     -> 0
@@ -404,7 +413,36 @@ class LlamaEngine private constructor(
                 downloadFileMultiSource(context, dir, file.name, file.sources, file.md5, onProgress)
             }
 
+            model.expertsRemotePrefix?.let { prefix ->
+                val expertsDir = File(dir, "experts")
+                check(expertsDir.exists() || expertsDir.mkdirs()) { "Cannot create expert directory" }
+                fun sources(name: String) = listOf(
+                    FileSource("HuggingFace", URL("https://huggingface.co/${model.hfRepo}/resolve/${model.hfBranch}/$prefix/$name")),
+                    FileSource("ModelScope", URL("https://www.modelscope.cn/models/${model.msRepo}/resolve/${model.msBranch}/$prefix/$name"))
+                )
+                downloadFileMultiSource(context, expertsDir, "manifest.json", sources("manifest.json"), null, onProgress)
+                for ((name, size) in expertFiles(expertsDir)) {
+                    downloadFileMultiSource(context, expertsDir, name, sources(name), null, onProgress)
+                    check(File(expertsDir, name).length() == size) { "Incomplete expert file: $name" }
+                }
+            }
+
             onProgress(context.getString(R.string.download_all_complete))
+        }
+
+        private fun expertFiles(dir: File): Map<String, Long> {
+            val entries = JSONObject(File(dir, "manifest.json").readText()).getJSONArray("entries")
+            val files = linkedMapOf<String, Long>()
+            for (i in 0 until entries.length()) {
+                val entry = entries.getJSONObject(i)
+                val name = entry.getString("repacked_file")
+                require(name.matches(Regex("layer_[0-9]{3}\\.bin"))) { "Invalid expert filename" }
+                val size = entry.getLong("expert_stride") * entry.getJSONArray("shape").getLong(2)
+                require(size > 0) { "Invalid expert size" }
+                files[name] = maxOf(files[name] ?: 0, size)
+            }
+            require(files.size == 40) { "Expected 40 expert layers" }
+            return files
         }
 
         /**
@@ -878,6 +916,7 @@ class LlamaEngine private constructor(
 
     private external fun init(nativeLibDir: String)
     private external fun load(modelPath: String): Int
+    private external fun configureExpertsNative(expertsPath: String, decodeWindow: Int)
     // image_max_slice_nums: 1..9 (or -1 for model default).  See JNI for
     // the semantics; the upper layer should pass MIN_IMAGE_SLICE..MAX_IMAGE_SLICE.
     private external fun loadMmproj(mmprojPath: String, imageMaxSliceNums: Int): Int
@@ -955,6 +994,14 @@ class LlamaEngine private constructor(
                 Log.i(TAG, "Loading model... \n$pathToModel")
                 _readyForSystemPrompt = false
                 _state.value = LlamaState.LoadingModel
+                val selected = getSelectedModel(context)
+                if (selected.expertsRemotePrefix != null) {
+                    require(modelsExist(context)) { "Download all expert files before loading this model" }
+                    configureExpertsNative(File(modelDirFor(context, selected), "experts").absolutePath, 8)
+                } else {
+                    configureExpertsNative("", 0)
+                }
+                setMinicpmvVersionNative(inferMinicpmvVersion(selected))
                 load(pathToModel).let {
                     if (it != 0) throw RuntimeException("Failed to load model (code: $it)")
                 }
@@ -998,6 +1045,9 @@ class LlamaEngine private constructor(
                 _state.value = LlamaState.ModelReady
             } catch (e: Exception) {
                 Log.e(TAG, (e.message ?: "Error loading model") + "\n" + pathToModel, e)
+                unload()
+                _mmprojLoaded = false
+                _readyForSystemPrompt = false
                 _state.value = LlamaState.Error(e)
                 throw e
             }

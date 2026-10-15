@@ -2,6 +2,13 @@
 
 **English** | [中文](README_zh.md)
 
+> **Experimental ML Guy Android fork:** this repository adds MiniCPM-V 4.7
+> Android model setup, CPU expert-loading fixes and failed-load cleanup.
+> See [Android S20 setup and test limits](ANDROID_S20.md) before building.
+> The patched engine is pinned in the `llama.cpp-omni` submodule. Upstream
+> download links below do not contain these fork changes. This fork has no
+> published APK release yet; existing app version fields are unchanged.
+
 This demo runs the MiniCPM-V family of multimodal models fully on-device on iOS, Android, and HarmonyOS NEXT. Currently supported:
 
 * **MiniCPM-V 2.6**
